@@ -1,0 +1,556 @@
+---
+title: "P8139 - Final Project"
+author: "Joe LaRocca"
+date: "2025-04-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(TCGAbiolinks)
+library(maftools)
+library(pheatmap)
+library(SummarizedExperiment)
+library(sesameData)
+library(sesame)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(minfi)
+library(limma)
+library(cowplot)
+library(glmnet)
+library(ggrepel)
+library(pROC)
+
+```
+
+## Save List of Projects
+
+```{r}
+
+gdcprojects = getGDCprojects()
+
+```
+
+
+## DNA Methylation Data
+
+### Make a Query for DNA Methylation Data
+
+```{r}
+
+query_TCGA_met = GDCquery(project = "TCGA-BRCA", 
+                      data.category = "DNA Methylation",
+                      data.type = "Methylation Beta Value",
+                      platform = "Illumina Human Methylation 27", 
+                      access = "open"
+                      )
+
+```
+
+### Methylation Query Output
+
+```{r}
+
+output_query_TCGA_met = getResults(query_TCGA_met)
+
+```
+
+### Download Methylation Data Files
+
+```{r}
+
+GDCdownload(query_TCGA_met)
+
+```
+
+### Create Methylation Data Object
+
+```{r}
+
+dna_meth_data = GDCprepare(query_TCGA_met, summarizedExperiment = TRUE)
+
+```
+
+### Create Methylation Data Assay
+
+```{r}
+
+dna_meth_assay = t(assay(dna_meth_data))
+
+```
+
+### Clean Data
+
+```{r}
+
+dna_meth_assay_cc = data.frame(dna_meth_assay) |>
+  mutate(case = output_query_TCGA_met$sample_type,
+         id = output_query_TCGA_met$cases.submitter_id) |>
+  select(case, id, everything()) |>
+  group_by(id) |>
+  filter(n() > 1) |>
+  arrange(id) |>
+  ungroup()
+
+dnam_ids = unique(dna_meth_assay_cc$id)
+
+```
+
+## Clinical Data
+
+### Make a Query for Clinical Data
+
+```{r}
+
+query_TCGA_clin = GDCquery(project = "TCGA-BRCA", 
+                      data.category = "Clinical",
+                      data.type = "Clinical Supplement",
+                      data.format = "BCR XML",
+                      barcode = dnam_ids)
+
+```
+
+## Get Results from Queries
+
+### Clinical Data
+
+```{r}
+
+output_query_TCGA_clin = getResults(query_TCGA_clin) |>
+  filter(data_format == "BCR XML")
+
+```
+
+
+### Download Data Files
+
+```{r}
+
+GDCdownload(query_TCGA_clin)
+
+```
+
+### Prepare Data
+
+```{r}
+
+clin_data = GDCprepare_clinic(query_TCGA_clin, clinical.info = "patient") 
+
+selected_cols = c("bcr_patient_barcode",
+         "age_at_initial_pathologic_diagnosis",
+         "race_list", 
+         "breast_carcinoma_surgical_procedure_name",
+         "breast_carcinoma_progesterone_receptor_status",
+         "breast_carcinoma_estrogen_receptor_status",
+         "number_of_lymphnodes_positive_by_he")
+
+clin_data_select = clin_data |>
+  select(all_of(selected_cols)) |> 
+  tibble() |>
+  dplyr::rename(id = bcr_patient_barcode)
+
+```
+
+```{r}
+
+min(clin_data$age_at_initial_pathologic_diagnosis)
+max(clin_data$age_at_initial_pathologic_diagnosis)
+mean(clin_data$age_at_initial_pathologic_diagnosis)
+summary(clin_data$age_at_initial_pathologic_diagnosis)
+
+```
+
+## Merging Data into One Frame
+
+```{r}
+
+brca_df = dna_meth_assay_cc |>
+  left_join(clin_data_select, by = "id") |>
+  dplyr::select(id, case, selected_cols[2:length(selected_cols)], everything()) |>
+  dplyr::select(where(~ mean(is.na(.)) == 0)) |>
+  dplyr::rename(age = age_at_initial_pathologic_diagnosis,
+         tissue_type = case,
+         race = race_list,
+         surg_procedure = breast_carcinoma_surgical_procedure_name,
+         prog_rec_status = breast_carcinoma_progesterone_receptor_status,
+         est_rec_status = breast_carcinoma_estrogen_receptor_status) |>
+  filter(id != "TCGA-E2-A15A",
+         id != "TCGA-E2-A15E")
+
+```
+
+## Analyzing Locations of CpG Sites
+
+```{r}
+
+annotation <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+view(annotation["cg04672450", ])
+
+```
+
+## Exploratory Data Analysis
+
+### Heat Map
+
+```{r}
+
+idx = dna_meth_data[, 1:2] %>%
+  assay %>%
+  rowVars() %>%
+  order(decreasing = TRUE) %>%
+  head(10)
+
+pheatmap(assay(dna_meth_data)[idx, ])
+
+```
+
+### Beta Value Distribution
+
+```{r}
+
+plotList_beta = list()
+
+plotList_beta[[1]] = brca_df |>
+  pivot_longer(
+    -c(id, tissue_type, age, race, surg_procedure, prog_rec_status, est_rec_status),
+    names_to = "cpg_site",
+    values_to = "beta_value"
+  ) |>
+  filter(tissue_type == "Primary Tumor") |>
+  ggplot(aes(x = beta_value)) + 
+  geom_histogram(fill = "firebrick3", col = "black", binwidth = 0.01) + 
+  labs(
+    title = "Tumor Tissue",
+    x = "Beta Value",
+    y = "Frequency"
+  ) +
+  theme_bw()
+
+plotList_beta[[2]] = brca_df |>
+  pivot_longer(
+    -c(id, tissue_type, age, race, surg_procedure, prog_rec_status, est_rec_status),
+    names_to = "cpg_site",
+    values_to = "beta_value"
+  ) |>
+  filter(tissue_type == "Solid Tissue Normal") |>
+  ggplot(aes(x = beta_value)) + 
+  geom_histogram(fill = "dodgerblue4", col = "black", binwidth = 0.01) + 
+  labs(
+    title = "Normal Tissue",
+    x = "Beta Value",
+    y = "Frequency"
+  ) +
+  theme_bw()
+
+pdf(
+  here::here("beta_hist_3.pdf"),
+  width = 11,
+  height = 5
+  )
+
+plot_grid(plotlist = plotList_beta)
+
+dev.off()
+
+```
+
+### Volcano Plot
+
+#### Make Data Objects
+
+```{r}
+
+M_raw = dna_meth_assay_cc |>
+  filter(id != "TCGA-E2-A15A",
+         id != "TCGA-E2-A15E") |> 
+  dplyr::select(where(~ mean(is.na(.)) == 0)) |>
+  dplyr::select(-id, -case)
+
+M_char = t(M_raw[, -1])
+
+M = apply(M_char, 2, as.numeric)
+
+M_final = log2(M / (1 - M))
+
+tissue_type = factor(brca_df$tissue_type)
+
+# Build design matrix
+
+design <- model.matrix(~ tissue_type)
+
+# Fit linear model
+fit <- lmFit(M_final, design)
+fit <- eBayes(fit)
+
+# Get results (comparison tumor vs normal)
+results <- topTable(fit, coef = 2, number = Inf)
+
+```
+
+#### Basic Plot
+
+```{r}
+
+# Basic volcano plot
+plot(
+  results$logFC, -log10(results$adj.P.Val),
+  pch = 20, cex = 0.6, col = "grey",
+  xlab = "Log2 Fold Change", ylab = "-log10(P-value)",
+  main = "Volcano Plot"
+)
+
+# Highlight significant points
+sig_up <- results$adj.P.Val < 0.05 & results$logFC > 0.35
+sig_down <- results$adj.P.Val < 0.05 & results$logFC < -0.35
+points(results$logFC[sig_up], -log10(results$P.Value[sig_up]), col = "firebrick3", pch = 20)
+points(results$logFC[sig_down], -log10(results$P.Value[sig_down]), col = "steelblue2", pch = 20)
+
+```
+
+#### Fancy Plot
+
+```{r}
+
+volcano_df <- results %>%
+  mutate(
+    negLogP = -log10(adj.P.Val),
+    significance = case_when(
+      adj.P.Val < 0.05 & logFC > 2 ~ "Hypermethylated",
+      adj.P.Val < 0.05 & logFC < -2 ~ "Hypomethylated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+pdf(
+  here::here("volc_plot.pdf"),
+  width = 11,
+  height = 5
+  )
+
+ggplot(volcano_df, aes(x = logFC, y = negLogP)) +
+  geom_point(aes(color = significance), alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Hypermethylated" = "firebrick3", 
+                                "Hypomethylated" = "steelblue2", 
+                                "Not significant" = "grey")) +
+  geom_vline(xintercept = c(-2, 2), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  labs(
+    x = "Log_2 Fold Change (M-Values)",
+    y = "-log_10 (adjusted P-value)",
+    color = "Significance"
+  ) +
+  theme_bw()
+
+dev.off()
+
+```
+
+#### Check counts for Hypo- and Hyper-Methylation
+
+```{r}
+
+# Number of hypomethylated CpG sites
+
+length(volcano_df$significance[volcano_df$significance == "Hypomethylated"])
+
+# Number of hypermethylated CpG sites
+
+length(volcano_df$significance[volcano_df$significance == "Hypermethylated"])
+
+```
+
+### PCA
+
+#### Create prcomp object
+
+```{r}
+
+brca_df_pc = brca_df_reg[, -c(1,2)] |>
+  mutate(race = as.numeric(race),
+         surg_procedure = as.numeric(surg_procedure),
+         prog_rec_status = as.numeric(prog_rec_status),
+         est_rec_status = as.numeric(est_rec_status)
+         )
+
+pca_meth = prcomp(brca_df_pc, scale. = TRUE)
+
+```
+
+#### Make the plot
+
+```{r}
+
+pca_df = as.data.frame(pca_meth$x) |>
+  mutate(Tissue = brca_df$tissue_type)
+
+pdf(
+  here::here("pca_plot.pdf"),
+  width = 11,
+  height = 5
+  )
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Tissue)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal(base_size = 14) +
+  labs(
+    x = paste0("PC1 (", round(100 * summary(pca_meth)$importance[2,1], 1), "%)"),
+    y = paste0("PC2 (", round(100 * summary(pca_meth)$importance[2,2], 1), "%)")
+    )
+
+dev.off()
+
+```
+
+
+## Regression Analysis
+
+```{r}
+
+brca_df_num = brca_df |>
+  mutate(tissue_type = (-as.numeric(factor(tissue_type)) + 2))
+
+beta_vals = brca_df_num |> 
+  dplyr::select(starts_with("cg"))
+
+m_vals = log2(beta_vals / (1 - beta_vals))
+
+brca_df_reg = brca_df_num |>
+  dplyr::select(!starts_with("cg")) |>
+  bind_cols(m_vals)
+
+```
+
+### Make CV Fit for ENet Model
+
+```{r}
+
+x = brca_df_reg |> dplyr::select(-id, -tissue_type) |> as.matrix()
+y = brca_df$tissue_type
+
+set.seed(2025)
+
+cv_fit <- cv.glmnet(
+  x, y,
+  alpha = 0.5,                # 0 = ridge, 1 = lasso, in-between = elastic net
+  family = "binomial",        # or "gaussian" for linear regression
+  type.measure = "auc",     # use "auc" for better binary performance
+  parallel = TRUE             # enable parallel processing (see below)
+)
+
+```
+
+### Make Plot of CV Fit
+
+```{r}
+
+pdf(
+  here::here("dnam_cv_fit.pdf"),
+  width = 11,
+  height = 5
+  )
+
+plot(cv_fit)
+
+dev.off()
+
+```
+
+```{r}
+
+coefs = coef(cv_fit, s = "lambda.1se")
+
+# Convert to a named vector
+coef_vec <- as.vector(coefs)
+names(coef_vec) <- rownames(coefs)
+
+# Filter non-zero (excluding intercept)
+nonzero_coefs <- coef_vec[coef_vec != 0]
+nonzero_coefs <- nonzero_coefs[names(nonzero_coefs) != "(Intercept)"]
+
+# Rank by absolute effect size
+top_predictors <- sort(nonzero_coefs, decreasing = TRUE)
+
+head(top_predictors, 10)  # top 10 CpG sites by positive effect
+tail(top_predictors, 10)  # top 10 CpG sites by negative effect
+
+```
+
+```{r}
+
+top_df <- data.frame(
+  CpG = names(top_predictors),
+  Coefficient = top_predictors
+)
+
+plotList_effects = list()
+
+plotList_effects[[1]] = ggplot(top_df[1:20, ], aes(x = reorder(CpG, Coefficient), y = Coefficient)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 CpG Sites by Positive Effect", x = "CpG Site", y = "Coefficient (Elastic Net)") + 
+  theme_bw()
+
+plotList_effects[[2]] = ggplot(top_df[(nrow(top_df) - 19):nrow(top_df), ], aes(x = reorder(CpG, Coefficient), y = Coefficient)) +
+  geom_bar(stat = "identity", fill = "firebrick3") +
+  coord_flip() +
+  labs(title = "Top 20 CpG Sites by Negative Effect", x = "CpG Site", y = "Coefficient (Elastic Net)") + 
+  theme_bw()
+
+pdf(
+  here::here("top_effects_2.pdf"),
+  width = 11,
+  height = 5
+  )
+
+plot_grid(plotlist = plotList_effects)
+
+dev.off()
+
+```
+
+### Predictions
+
+```{r}
+
+enet_pred = as.numeric(predict(cv_fit, newx = x,, s = "lambda.1se", type = "response") < 0.5)
+enet_pred == brca_df_reg$tissue_type
+
+```
+
+### ROC AUC
+
+```{r}
+
+roc_obj = roc(brca_df_reg$tissue_type, enet_pred)
+auc(roc_obj)
+
+```
+
+### Annotation Time!
+
+#### Top 10 by pos/neg effect size
+
+```{r}
+
+annotation <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+view(annotation[names(head(top_predictors, 1)), ])
+
+view(annotation[names(tail(top_predictors, 1)), ])
+
+```
+
+#### All predictors included in enet model
+
+```{r}
+
+total_anno = rbind(annotation[names(head(top_predictors, 58)), ],
+      annotation[names(tail(top_predictors, 50)), ])
+
+table(total_anno$Relation_to_Island)
+
+```
+
